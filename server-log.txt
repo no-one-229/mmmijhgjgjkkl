@@ -1,0 +1,1 @@
+[manager] No saved world; Minecraft will generate a new one
