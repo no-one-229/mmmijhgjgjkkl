@@ -100,3 +100,5 @@
 [manager] Server ready
 [manager] Starting Pinggy (free, no token)
 [manager] Tunnel: tcp://vscze-20-119-95-17.run.pinggy-free.link:46271
+[11:20:10] [Server thread/INFO] [minecraft/PlayerList]: TWIX_EXTRATOP[/127.0.0.1:54682] logged in with entity id 370 at (7.5, 88.0, 7.5)
+[11:20:10] [Server thread/INFO] [minecraft/MinecraftServer]: TWIX_EXTRATOP joined the game
