@@ -1,0 +1,750 @@
+name: MC Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      memory:
+        description: Java heap
+        required: true
+        default: '6G'
+        type: choice
+        options: ['3G', '4G', '6G']
+      world_source:
+        description: 'repository = сохранить мир; new = новый; import = ZIP из Release'
+        required: true
+        default: repository
+        type: choice
+        options: [repository, new, import]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mc-server-v2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PINGGY_TOKEN: ${{ secrets.PINGGY_TOKEN }}
+      REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      FORGE: '1.20.1-47.4.0'
+      MC_MEMORY: ${{ inputs.memory }}
+      WORLD_SOURCE: ${{ inputs.world_source }}
+      OP_NAME: TWIX_EXTRATOP
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Forge
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p srv
+          curl --fail --location --retry 3 --max-time 300 \
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/${FORGE}/forge-${FORGE}-installer.jar" \
+            -o /tmp/forge-installer.jar
+          java -jar /tmp/forge-installer.jar --installServer ./srv
+
+      - name: Create server manager
+        run: |
+          cat > /tmp/mc-manager.py <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import signal
+          import socket
+          import struct
+          import subprocess
+          import tarfile
+          import threading
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import uuid
+          import zipfile
+          from collections import deque
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          SRV = ROOT / "srv"
+          TOKEN = os.environ["GH_TOKEN"]
+          REPO = os.environ["REPO"]
+          BRANCH = os.environ["BRANCH"]
+          FORGE = os.environ["FORGE"]
+          MEMORY = os.environ["MC_MEMORY"]
+          SOURCE = os.environ["WORLD_SOURCE"]
+          HEALTH_FAILURE_SECONDS = 180
+          log_lines = deque(maxlen=350)
+          log_lock = threading.Lock()
+          stopping = threading.Event()
+          ready = threading.Event()
+          server_shutdown = threading.Event()
+          reader = None
+          process = None
+          tunnel = None
+          world_prepared = False
+          runtime_started = False
+          last_command_sha = None
+          tunnel_pending = False
+          tunnel_deadline = 0
+          next_tunnel_attempt = 0
+          tunnel_failures = 0
+          tunnel_address = None
+          unpublished_address = None
+          next_address_publish = 0
+
+          def message(text):
+              line = "[manager] " + str(text)
+              print(line, flush=True)
+              with log_lock:
+                  log_lines.append(line)
+
+          def api(method, path, payload=None, accept=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              headers = {
+                  "Authorization": "Bearer " + TOKEN,
+                  "Accept": accept or "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "mc-server-manager",
+              }
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  data=data, method=method, headers=headers
+              )
+              with urllib.request.urlopen(req, timeout=15) as response:
+                  raw = response.read()
+                  return json.loads(raw) if raw else None
+
+          def get_file(name):
+              path = urllib.parse.quote(name, safe="/")
+              ref = urllib.parse.quote(BRANCH, safe="")
+              try:
+                  return api("GET", f"/repos/{REPO}/contents/{path}?ref={ref}")
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return None
+                  raise
+
+          def put_file(name, text, expected_sha=None):
+              current = get_file(name)
+              current_sha = current.get("sha") if current else None
+              if expected_sha is not None and current_sha != expected_sha:
+                  raise RuntimeError(f"{name} changed; not overwriting")
+              if current and current.get("content"):
+                  old = base64.b64decode(current["content"]).decode("utf-8")
+                  if old == text:
+                      return
+              payload = {
+                  "message": f"MC: update {name} [skip ci]",
+                  "content": base64.b64encode(text.encode("utf-8")).decode(),
+                  "branch": BRANCH,
+              }
+              if current_sha:
+                  payload["sha"] = current_sha
+              path = urllib.parse.quote(name, safe="/")
+              api("PUT", f"/repos/{REPO}/contents/{path}", payload)
+
+          def release_asset(tag, filename, destination, optional=False):
+              tag = urllib.parse.quote(tag, safe="")
+              try:
+                  release = api("GET", f"/repos/{REPO}/releases/tags/{tag}")
+              except urllib.error.HTTPError as error:
+                  if optional and error.code == 404:
+                      return False
+                  raise
+              asset = next((a for a in release["assets"] if a["name"] == filename), None)
+              if asset is None:
+                  if optional:
+                      message(f"No {filename} in release {tag}")
+                      return False
+                  raise RuntimeError(f"Release {tag} must contain {filename}")
+              with open(destination, "wb") as output:
+                  subprocess.run([
+                      "gh", "api", "-H", "Accept: application/octet-stream",
+                      f"/repos/{REPO}/releases/assets/{asset['id']}",
+                  ], stdout=output, check=True, timeout=600)
+              return True
+
+          def safe_target(base, name):
+              target = (base / name).resolve()
+              if not target.is_relative_to(base.resolve()):
+                  raise RuntimeError("Unsafe archive path: " + name)
+              return target
+
+          def extract_mods(archive):
+              destination = SRV / "mods"
+              with tarfile.open(archive, "r:gz") as bundle:
+                  for member in bundle.getmembers():
+                      safe_target(destination, member.name)
+                      if not (member.isfile() or member.isdir()):
+                          raise RuntimeError("Links/special files not allowed in mods archive")
+                  bundle.extractall(destination, filter="data")
+              if any(p.parent != destination for p in destination.rglob("*.jar")):
+                  raise RuntimeError("JAR files must be at archive root")
+
+          def copy_tree(source, destination):
+              if source.is_dir():
+                  shutil.copytree(source, destination, dirs_exist_ok=True)
+
+          def export_missing(source, destination):
+              if not source.is_dir():
+                  return
+              for item in source.rglob("*"):
+                  if not item.is_file() or item.is_symlink():
+                      continue
+                  target = destination / item.relative_to(source)
+                  if not target.exists():
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(item, target)
+
+          def read_properties(path):
+              result = {}
+              for line in path.read_text(encoding="utf-8").splitlines():
+                  line = line.strip()
+                  if line and not line.startswith(("#", "!")) and "=" in line:
+                      key, value = line.split("=", 1)
+                      result[key.strip()] = value.strip()
+              return result
+
+          def prepare():
+              global world_prepared
+              for name in ("config", "serverconfig", "defaultconfigs", "mods"):
+                  (ROOT / name).mkdir(exist_ok=True)
+              properties = ROOT / "server.properties"
+              if not properties.exists():
+                  properties.write_text(
+                      "level-name=world\nlevel-seed=\nonline-mode=false\n"
+                      "white-list=false\nenforce-whitelist=true\n"
+                      "server-port=25565\nserver-ip=\nmotd=Minecraft on GitHub\n"
+                      "difficulty=normal\ngamemode=survival\nmax-players=20\n"
+                      "view-distance=7\nsimulation-distance=5\nspawn-protection=0\n"
+                      "enable-command-block=false\nenable-rcon=false\n"
+                      "enable-query=false\nuse-native-transport=true\n"
+                      "network-compression-threshold=256\n", encoding="utf-8"
+                  )
+              settings = read_properties(properties)
+              if settings.get("level-name") != "world":
+                  raise RuntimeError("Keep level-name=world")
+              if settings.get("server-port", "25565") != "25565":
+                  raise RuntimeError("Keep server-port=25565")
+              if settings.get("server-ip", "") not in ("", "0.0.0.0", "127.0.0.1"):
+                  raise RuntimeError("Keep server-ip empty for local health checks")
+              shutil.copy2(properties, SRV / "server.properties")
+              # The manager needs status replies; the repository file is not rewritten.
+              with (SRV / "server.properties").open("a", encoding="utf-8") as output:
+                  output.write("\n# Manager local health check\nenable-status=true\n")
+              (SRV / "eula.txt").write_text("eula=true\n")
+              destination = SRV / "world"
+              if destination.exists():
+                  shutil.rmtree(destination)
+              if SOURCE == "repository":
+                  if (ROOT / "world/level.dat").is_file():
+                      copy_tree(ROOT / "world", destination)
+                      message("Loaded world/ from repository")
+                  elif (ROOT / "world").exists() and any((ROOT / "world").iterdir()):
+                      raise RuntimeError("world/ exists but has no level.dat")
+                  else:
+                      message("No saved world; Minecraft will generate a new one")
+              elif SOURCE == "new":
+                  message("New world requested; old world will not be loaded")
+              elif SOURCE == "import":
+                  archive = Path("/tmp/import-world.zip")
+                  release_asset("world-import", "world.zip", archive)
+                  temp = Path("/tmp/import-world")
+                  if temp.exists():
+                      shutil.rmtree(temp)
+                  temp.mkdir()
+                  with zipfile.ZipFile(archive) as bundle:
+                      for info in bundle.infolist():
+                          safe_target(temp, info.filename)
+                      bundle.extractall(temp)
+                  candidates = list(temp.rglob("level.dat"))
+                  if len(candidates) != 1:
+                      raise RuntimeError("world.zip must contain exactly one level.dat")
+                  copy_tree(candidates[0].parent, destination)
+                  message("Imported world.zip")
+              else:
+                  raise RuntimeError("Unknown world_source")
+              copy_tree(ROOT / "config", SRV / "config")
+              copy_tree(ROOT / "defaultconfigs", SRV / "defaultconfigs")
+              copy_tree(ROOT / "serverconfig", destination / "serverconfig")
+              for name in ("ops.json", "whitelist.json", "banned-players.json", "banned-ips.json"):
+                  source = ROOT / name
+                  if not source.exists():
+                      source.write_text("[]\n")
+                  json.loads(source.read_text(encoding="utf-8"))
+                  shutil.copy2(source, SRV / name)
+              name = os.environ.get("OP_NAME", "").strip()
+              if name and settings.get("online-mode") == "false":
+                  digest = hashlib.md5(("OfflinePlayer:" + name).encode()).digest()
+                  player_uuid = str(uuid.UUID(bytes=digest, version=3))
+                  ops_path = SRV / "ops.json"
+                  ops = json.loads(ops_path.read_text())
+                  ops = [entry for entry in ops if entry.get("uuid") != player_uuid]
+                  ops.append({"uuid": player_uuid, "name": name, "level": 4,
+                              "bypassesPlayerLimit": True})
+                  ops_path.write_text(json.dumps(ops, indent=2))
+              (SRV / "mods").mkdir(exist_ok=True)
+              copy_tree(ROOT / "mods", SRV / "mods")
+              archive = Path("/tmp/mods.tar.gz")
+              if release_asset("mods-pack", "mods.tar.gz", archive, optional=True):
+                  extract_mods(archive)
+              for jar in sorted((SRV / "mods").glob("*.jar")):
+                  message("Mod: " + jar.name)
+              world_prepared = True
+
+          def kill_group(child, grace=5):
+              if child is None:
+                  return
+              try:
+                  os.killpg(child.pid, signal.SIGTERM)
+              except ProcessLookupError:
+                  return
+              try:
+                  child.wait(timeout=grace)
+              except subprocess.TimeoutExpired:
+                  try:
+                      os.killpg(child.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+                  child.wait(timeout=5)
+
+          def stop_tunnel():
+              global tunnel
+              child, tunnel = tunnel, None
+              kill_group(child)
+
+          def queue_address(address):
+              global unpublished_address, next_address_publish
+              unpublished_address = address
+              next_address_publish = 0
+
+          def begin_tunnel():
+              global tunnel, tunnel_pending, tunnel_deadline
+              global tunnel_address
+              stop_tunnel()
+              token = os.environ.get("PINGGY_TOKEN", "").strip()
+              host = token + "+tcp@pro.pinggy.io" if token else "tcp@free.pinggy.io"
+              message("Starting Pinggy (token supplied)" if token else "Starting Pinggy (free, no token)")
+              Path("/tmp/pinggy-current.log").write_text("")
+              with open("/tmp/pinggy.log", "a") as history:
+                  history.write("\n--- Pinggy attempt " + time.strftime("%Y-%m-%d %H:%M:%S") + " ---\n")
+              with open("/tmp/pinggy-current.log", "w") as output:
+                  tunnel = subprocess.Popen([
+                      "ssh", "-T", "-o", "StrictHostKeyChecking=no",
+                      "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+                      "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=15",
+                      "-p", "443", "-R", "0:127.0.0.1:25565", host,
+                  ], stdin=subprocess.DEVNULL, stdout=output,
+                      stderr=subprocess.STDOUT, start_new_session=True)
+              tunnel_address = None
+              tunnel_pending = True
+              tunnel_deadline = time.monotonic() + 90
+
+          def archive_tunnel_log():
+              source = Path("/tmp/pinggy-current.log")
+              if source.exists():
+                  with open("/tmp/pinggy.log", "a") as output:
+                      output.write(source.read_text(errors="replace"))
+
+          def tick_tunnel(now):
+              global tunnel_pending, next_tunnel_attempt, tunnel_failures
+              global tunnel_address, unpublished_address, next_address_publish
+              if stopping.is_set() or server_shutdown.is_set():
+                  return
+              if tunnel is None and now >= next_tunnel_attempt:
+                  try:
+                      begin_tunnel()
+                  except Exception as error:
+                      tunnel_failures += 1
+                      next_tunnel_attempt = time.monotonic() + min(60, 5 * tunnel_failures)
+                      message("Pinggy launch failed; Minecraft stays running: " + str(error))
+              if tunnel is not None:
+                  alive = tunnel.poll() is None
+                  if tunnel_pending and alive:
+                      text = Path("/tmp/pinggy-current.log").read_text(errors="replace")
+                      text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+                      match = re.search(r"tcp://[A-Za-z0-9.-]+:\d+", text)
+                      if match:
+                          tunnel_address = match.group(0)
+                          tunnel_pending = False
+                          tunnel_failures = 0
+                          queue_address(tunnel_address + "\n")
+                          message("Tunnel: " + tunnel_address)
+                  if not alive or (tunnel_pending and now >= tunnel_deadline):
+                      message("Pinggy disconnected/timeout; reconnecting without stopping Minecraft")
+                      stop_tunnel()
+                      archive_tunnel_log()
+                      tunnel_pending = False
+                      tunnel_address = None
+                      queue_address("")
+                      tunnel_failures += 1
+                      next_tunnel_attempt = time.monotonic() + min(60, 5 * tunnel_failures)
+              if unpublished_address is not None and now >= next_address_publish:
+                  try:
+                      put_file("tunnel.txt", unpublished_address)
+                      unpublished_address = None
+                  except Exception as error:
+                      message("Tunnel address upload failed; retrying: " + str(error))
+                      next_address_publish = time.monotonic() + 20
+
+          def read_output():
+              try:
+                  with open("/tmp/mc.log", "w", encoding="utf-8") as log:
+                      for line in process.stdout:
+                          log.write(line)
+                          log.flush()
+                          print(line, end="", flush=True)
+                          with log_lock:
+                              log_lines.append(line.rstrip())
+                          if "Done (" in line:
+                              ready.set()
+                          if re.search(r"\[minecraft/MinecraftServer\]: Stopping server\b", line):
+                              server_shutdown.set()
+                          if "Encountered an unexpected exception" in line or "This crash report has been saved to:" in line:
+                              server_shutdown.set()
+              except Exception as error:
+                  message("Log reader failed: " + str(error))
+
+          def send(command):
+              if process is None or process.poll() is not None:
+                  raise RuntimeError("Minecraft is not running")
+              process.stdin.write(command + "\n")
+              process.stdin.flush()
+
+          def publish_logs():
+              with log_lock:
+                  text = "\n".join(log_lines) + "\n"
+              put_file("server-log.txt", text)
+
+          def poll_command():
+              global last_command_sha
+              item = get_file("command.txt")
+              if item is None:
+                  put_file("command.txt", "\n")
+                  return
+              command = base64.b64decode(item.get("content", "")).decode("utf-8").strip()
+              if not command:
+                  last_command_sha = None
+                  return
+              if item["sha"] == last_command_sha:
+                  return
+              if "\n" in command or "\r" in command:
+                  raise RuntimeError("Use one command per command.txt")
+              command = command.lstrip("/")
+              if command.upper() == "STOP":
+                  command = "stop"
+              last_command_sha = item["sha"]
+              send(command)
+              if command.lower() == "stop":
+                  stopping.set()
+              message("Submitted to Minecraft: " + command)
+              put_file("command.txt", "\n", expected_sha=item["sha"])
+
+          def varint(value):
+              out = bytearray()
+              while True:
+                  b = value & 127
+                  value >>= 7
+                  out.append(b | (128 if value else 0))
+                  if not value:
+                      return bytes(out)
+
+          def recv_exact(sock, count):
+              output = b""
+              while len(output) < count:
+                  part = sock.recv(count - len(output))
+                  if not part:
+                      raise ConnectionError("Status connection closed")
+                  output += part
+              return output
+
+          def recv_varint(sock):
+              value = 0
+              for shift in range(0, 35, 7):
+                  b = recv_exact(sock, 1)[0]
+                  value |= (b & 127) << shift
+                  if not b & 128:
+                      return value
+              raise ValueError("Invalid VarInt")
+
+          def check_minecraft():
+              # Actual Minecraft status request, not only an open TCP port.
+              with socket.create_connection(("127.0.0.1", 25565), timeout=5) as sock:
+                  sock.settimeout(5)
+                  host = b"localhost"
+                  handshake = b"\x00" + varint(763) + varint(len(host)) + host + struct.pack(">H", 25565) + b"\x01"
+                  sock.sendall(varint(len(handshake)) + handshake + b"\x01\x00")
+                  size = recv_varint(sock)
+                  if not 3 <= size <= 2 * 1024 * 1024:
+                      raise ValueError("Invalid Minecraft status length")
+                  # Read the full packet with a total time budget, even if data trickles in.
+                  deadline = time.monotonic() + 10
+                  data = bytearray()
+                  while len(data) < size:
+                      left = deadline - time.monotonic()
+                      if left <= 0:
+                          raise TimeoutError("Minecraft status reply timed out")
+                      sock.settimeout(min(5, left))
+                      data.extend(recv_exact(sock, min(65536, size - len(data))))
+                  if data[0] != 0:
+                      raise ValueError("Unexpected status packet")
+                  pos, length, shift = 1, 0, 0
+                  while True:
+                      b = data[pos]
+                      pos += 1
+                      length |= (b & 127) << shift
+                      if not b & 128:
+                          break
+                      shift += 7
+                      if shift >= 35:
+                          raise ValueError("Invalid status string length")
+                  reply = json.loads(bytes(data[pos:pos+length]))
+                  if not isinstance(reply, dict) or "version" not in reply:
+                      raise ValueError("Invalid Minecraft status JSON")
+
+          def run_server():
+              global process, runtime_started, reader
+              if not re.fullmatch(r"[346]G", MEMORY):
+                  raise RuntimeError("Invalid memory setting")
+              args = f"libraries/net/minecraftforge/forge/{FORGE}/unix_args.txt"
+              process = subprocess.Popen([
+                  "java", "-Xms1G", "-Xmx" + MEMORY, "@" + args, "nogui"
+              ], cwd=SRV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                 errors="replace", bufsize=1, start_new_session=True)
+              runtime_started = True
+              reader = threading.Thread(target=read_output, daemon=True)
+              reader.start()
+              started = time.monotonic()
+              next_log = next_health = 0
+              health_failed_since = None
+              configs_exported = False
+              queue_address("")
+              while process.poll() is None and not stopping.is_set():
+                  now = time.monotonic()
+                  if server_shutdown.is_set():
+                      message("Minecraft shutdown/crash detected; finishing workflow")
+                      break
+                  if now - started > 300 * 60:
+                      message("Session limit reached; stopping safely")
+                      stopping.set()
+                      break
+                  if not ready.is_set() and now - started > 15 * 60:
+                      raise RuntimeError("Minecraft startup timeout")
+                  if ready.is_set():
+                      if not configs_exported:
+                          export_missing(SRV / "config", ROOT / "config")
+                          export_missing(SRV / "defaultconfigs", ROOT / "defaultconfigs")
+                          export_missing(SRV / "world/serverconfig", ROOT / "serverconfig")
+                          message("Server ready")
+                          configs_exported = True
+                      if now >= next_health:
+                          try:
+                              check_minecraft()
+                              if health_failed_since is not None:
+                                  message("Minecraft health check recovered")
+                              health_failed_since = None
+                          except Exception as error:
+                              if health_failed_since is None:
+                                  health_failed_since = time.monotonic()
+                              message("Minecraft status check failed: " + str(error))
+                              if time.monotonic() - health_failed_since >= HEALTH_FAILURE_SECONDS:
+                                  raise RuntimeError("Minecraft unresponsive for 180 seconds")
+                          next_health = time.monotonic() + 30
+                      if server_shutdown.is_set() or process.poll() is not None:
+                          break
+                      tick_tunnel(time.monotonic())
+                      if stopping.is_set() or server_shutdown.is_set():
+                          break
+                      try:
+                          poll_command()
+                      except Exception as error:
+                          message("Command relay: " + str(error))
+                  if now >= next_log and not stopping.is_set():
+                      try:
+                          publish_logs()
+                      except Exception as error:
+                          message("Log upload: " + str(error))
+                      next_log = time.monotonic() + 60
+                  stopping.wait(5)
+              if process.poll() not in (None, 0):
+                  raise RuntimeError(f"Minecraft exited with code {process.returncode}")
+
+          def stop_server():
+              stopping.set()
+              if process is None:
+                  return True
+              if process.poll() is None:
+                  if not server_shutdown.is_set():
+                      try:
+                          send("stop")
+                      except Exception as error:
+                          message("Cannot send stop: " + str(error))
+                  try:
+                      process.wait(timeout=120)
+                  except subprocess.TimeoutExpired:
+                      message("Java did not exit in 120 seconds; terminating process group")
+                      kill_group(process, grace=15)
+                      if reader is not None:
+                          reader.join(timeout=5)
+                      return False
+              if reader is not None:
+                  reader.join(timeout=5)
+              return process.returncode == 0
+
+          def git(*args):
+              subprocess.run(["git", *args], check=True, timeout=180)
+
+          def save_repository(clean_shutdown):
+              git("fetch", "origin", BRANCH)
+              git("reset", "--hard", "FETCH_HEAD")
+              export_missing(SRV / "config", ROOT / "config")
+              export_missing(SRV / "defaultconfigs", ROOT / "defaultconfigs")
+              export_missing(SRV / "world/serverconfig", ROOT / "serverconfig")
+              properties = ROOT / "server.properties"
+              if not properties.exists() and (SRV / "server.properties").exists():
+                  shutil.copy2(SRV / "server.properties", properties)
+              for name in ("ops.json", "whitelist.json", "banned-players.json", "banned-ips.json"):
+                  if not (ROOT / name).exists() and (SRV / name).exists():
+                      shutil.copy2(SRV / name, ROOT / name)
+              if clean_shutdown and (SRV / "world/level.dat").is_file():
+                  target = ROOT / "world"
+                  if target.exists():
+                      shutil.rmtree(target)
+                  copy_tree(SRV / "world", target)
+                  (target / "session.lock").unlink(missing_ok=True)
+              else:
+                  message("Not replacing repository world: shutdown unclean or level.dat missing; use recovery artifact")
+              (ROOT / "tunnel.txt").write_text("")
+              (ROOT / "command.txt").write_text("\n")
+              with log_lock:
+                  (ROOT / "server-log.txt").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+              paths = ["server.properties", "config", "serverconfig", "defaultconfigs",
+                       "world", "ops.json", "whitelist.json", "banned-players.json",
+                       "banned-ips.json", "tunnel.txt", "command.txt", "server-log.txt"]
+              existing = [p for p in paths if (ROOT / p).exists()]
+              oversized = [str(p.relative_to(ROOT)) for folder in existing
+                           for p in ((ROOT / folder).rglob("*") if (ROOT / folder).is_dir() else [ROOT / folder])
+                           if p.is_file() and p.stat().st_size >= 100 * 1024 * 1024]
+              if oversized:
+                  raise RuntimeError("Files too large for Git; use recovery artifact: " + ", ".join(oversized))
+              git("config", "user.name", "MC Bot")
+              git("config", "user.email", "mc-bot@users.noreply.github.com")
+              git("add", "-f", "--", *existing)
+              result = subprocess.run(["git", "diff", "--cached", "--quiet"], timeout=30)
+              if result.returncode == 0:
+                  message("No repository changes")
+                  return
+              if result.returncode != 1:
+                  raise RuntimeError("git diff failed")
+              git("commit", "-m", "MC: save world and configs [skip ci]")
+              for attempt in range(3):
+                  result = subprocess.run(["git", "push", "origin", f"HEAD:refs/heads/{BRANCH}"], timeout=180)
+                  if result.returncode == 0:
+                      message("World and settings saved to repository")
+                      return
+                  git("pull", "--rebase", "origin", BRANCH)
+                  time.sleep(2)
+              raise RuntimeError("Git push failed; download recovery artifact")
+
+          def handle_signal(signum, frame):
+              stopping.set()
+
+          signal.signal(signal.SIGTERM, handle_signal)
+          signal.signal(signal.SIGINT, handle_signal)
+          failed = False
+          try:
+              prepare()
+              if not stopping.is_set():
+                  run_server()
+          except Exception as error:
+              failed = True
+              message("ERROR: " + str(error))
+          finally:
+              stopping.set()
+              clean = False
+              try:
+                  clean = stop_server()
+                  if runtime_started and not clean:
+                      failed = True
+              except Exception as error:
+                  failed = True
+                  message("SHUTDOWN ERROR: " + str(error))
+                  try:
+                      kill_group(process)
+                  except Exception as kill_error:
+                      message("KILL ERROR: " + str(kill_error))
+              try:
+                  stop_tunnel()
+                  archive_tunnel_log()
+              except Exception as error:
+                  message("Tunnel cleanup: " + str(error))
+              try:
+                  put_file("tunnel.txt", "")
+              except Exception as error:
+                  message("Could not clear tunnel status: " + str(error))
+              if runtime_started and world_prepared:
+                  try:
+                      save_repository(clean)
+                  except Exception as error:
+                      failed = True
+                      message("SAVE ERROR: " + str(error))
+          message("Manager finished; recovery artifact steps run next")
+          if failed:
+              raise SystemExit(1)
+          PY
+
+      - name: Run Minecraft and save data
+        timeout-minutes: 330
+        run: python3 -u /tmp/mc-manager.py
+
+      - name: Prepare recovery archive
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/mc-recovery
+          if [ -d srv/world ]; then
+            tar -czf /tmp/mc-recovery/world.tar.gz -C srv world
+          fi
+          for f in /tmp/mc.log /tmp/pinggy.log /tmp/pinggy-current.log; do
+            if [ -f "$f" ]; then cp "$f" /tmp/mc-recovery/; fi
+          done
+
+      - name: Upload recovery and configs
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@v4
+        with:
+          name: mc-recovery-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: warn
+          include-hidden-files: true
+          path: |
+            /tmp/mc-recovery/
+            srv/logs/
+            srv/crash-reports/
+            srv/config/
+            srv/world/serverconfig/
+            srv/defaultconfigs/
