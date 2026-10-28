@@ -102,3 +102,15 @@
 [manager] Tunnel: tcp://vscze-20-119-95-17.run.pinggy-free.link:46271
 [11:20:10] [Server thread/INFO] [minecraft/PlayerList]: TWIX_EXTRATOP[/127.0.0.1:54682] logged in with entity id 370 at (7.5, 88.0, 7.5)
 [11:20:10] [Server thread/INFO] [minecraft/MinecraftServer]: TWIX_EXTRATOP joined the game
+[11:20:42] [Server thread/INFO] [minecraft/MinecraftServer]: [TWIX_EXTRATOP: Stopping the server]
+[11:20:42] [Server thread/INFO] [minecraft/MinecraftServer]: Stopping server
+[11:20:42] [Server thread/INFO] [minecraft/MinecraftServer]: Saving players
+[11:20:42] [Server thread/INFO] [minecraft/MinecraftServer]: Saving worlds
+[11:20:43] [Server thread/INFO] [minecraft/MinecraftServer]: Saving chunks for level 'ServerLevel[world]'/minecraft:overworld
+[manager] Minecraft shutdown/crash detected; finishing workflow
+[11:20:44] [Server thread/INFO] [minecraft/MinecraftServer]: Saving chunks for level 'ServerLevel[world]'/minecraft:the_end
+[11:20:44] [Server thread/INFO] [minecraft/MinecraftServer]: Saving chunks for level 'ServerLevel[world]'/minecraft:the_nether
+[11:20:44] [Server thread/INFO] [minecraft/MinecraftServer]: ThreadedAnvilChunkStorage (world): All chunks are saved
+[11:20:44] [Server thread/INFO] [minecraft/MinecraftServer]: ThreadedAnvilChunkStorage (DIM1): All chunks are saved
+[11:20:44] [Server thread/INFO] [minecraft/MinecraftServer]: ThreadedAnvilChunkStorage (DIM-1): All chunks are saved
+[11:20:44] [Server thread/INFO] [minecraft/MinecraftServer]: ThreadedAnvilChunkStorage: All dimensions are saved
